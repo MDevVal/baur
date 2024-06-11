@@ -1,14 +1,16 @@
-use std::io::Write;
-use std::{env, io::stdout};
+use std::env;
 use std::process::Command;
 use reqwest::blocking::get;
 use serde_json::Value;
 use std::io::BufReader;
 use std::io::BufRead;
-use std::process::{Stdio};
+use std::process::Stdio;
+use std::error::Error;
+use std::path::PathBuf;
+use dialoguer::Confirm;
+use dirs;
 
-// baur -<operation><options> for example -Syu where S is the operation and y and u are options
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
     let _additional_options: Vec<String> = Vec::new();
     let mut operation: Option<char> = None;
@@ -41,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Synchronizing packages");
                     match target {
                         Some(pkg) => {
-                            sync(&pkg);
+                            sync(&pkg)?;
                         }
                         None => {
                             println!("error: No package provided");
@@ -76,63 +78,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn sync(package: &str) {
-    let baur_directory = std::env::var("HOME").expect("Failed to get home directory") + "/.cache/baur";
-    if !std::path::Path::new(&baur_directory).exists() {
-        std::fs::create_dir(&baur_directory).expect("Failed to create baur cache directory");
-    }
+fn sync(package: &str) -> Result<(), Box<dyn Error>> {
+    let baur_directory = get_baur_directory()?;
+    let pkg_info = fetch_package_info(package)?;
 
-    let pkg_url = format!("https://aur.archlinux.org/rpc/v5/info/{}", package);
-    let body = get(pkg_url).expect("Failed to fetch package").text().expect("Failed to parse package");
-    let json: Value = serde_json::from_str(&body).expect("Failed to parse JSON");
-
-    if json["resultcount"].as_u64().expect("Failed to parse resultcount") > 1 {
+    if pkg_info.len() > 1 {
         println!("error: Multiple packages found");
-    } else if json["resultcount"] == 0 {
+    } else if pkg_info.is_empty() {
         println!("error: No packages found");
     } else {
-        let pkg = &json["results"][0];
-        let pkg_name = pkg["Name"].as_str().unwrap();
-        let pkg_version = pkg["Version"].as_str().unwrap();
-        let pkg_description = pkg["Description"].as_str().unwrap();
-        println!("Name: {}", pkg_name);
-        println!("Version: {}", pkg_version);
-        println!("Description: {}", pkg_description);
-        print!("\nDo you want to install this package? [Y/n] ");
+        let pkg = &pkg_info[0];
+        display_package_info(pkg);
 
-        let _ = stdout().flush();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).expect("Failed to read input");
-        match input.trim() {
-            "Y" | "y" => {
-                let pkg_directory = format!("{}/{}", &baur_directory, pkg_name);
-                let repo = format!("https://aur.archlinux.org/{}.git", pkg_name);
-                Command::new("git").arg("clone").arg(repo).arg(&pkg_directory).current_dir(&baur_directory).output().expect("Failed to clone repository");
-                makepkg(&pkg_directory).expect("Failed to build package");
-            }
-            _ => {
-                println!("Aborted");
-            }
+        if confirm_install()? {
+            let pkg_directory = install_package(pkg, &baur_directory)?;
+            build_package(&pkg_directory)?;
+        } else {
+            println!("Aborted");
         }
     }
+
+    Ok(())
 }
 
-fn makepkg(directory: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let process = Command::new("makepkg") 
+fn get_baur_directory() -> Result<PathBuf, Box<dyn Error>> {
+    let home_dir = dirs::home_dir().ok_or("Failed to get home directory")?;
+    let baur_directory = home_dir.join(".cache/baur");
+
+    if !baur_directory.exists() {
+        std::fs::create_dir_all(&baur_directory)?;
+    }
+
+    Ok(baur_directory)
+}
+
+fn fetch_package_info(package: &str) -> Result<Vec<Value>, Box<dyn Error>> {
+    let pkg_url = format!("https://aur.archlinux.org/rpc/v5/info/{}", package);
+    let body = get(pkg_url)?.text()?;
+    let json: Value = serde_json::from_str(&body)?;
+
+    Ok(json["results"].as_array().cloned().unwrap_or_default())
+}
+
+fn display_package_info(pkg: &Value) {
+    let pkg_name = pkg["Name"].as_str().unwrap_or("Unknown");
+    let pkg_version = pkg["Version"].as_str().unwrap_or("Unknown");
+    let pkg_description = pkg["Description"].as_str().unwrap_or("No description");
+
+    println!("Name: {}", pkg_name);
+    println!("Version: {}", pkg_version);
+    println!("Description: {}", pkg_description);
+}
+
+fn confirm_install() -> Result<bool, Box<dyn Error>> {
+    let confirm = Confirm::new()
+        .with_prompt("Do you want to install this package?")
+        .interact()?;
+
+    Ok(confirm)
+}
+
+fn install_package(pkg: &Value, baur_directory: &PathBuf) -> Result<PathBuf, Box<dyn Error>> {
+    let pkg_name = pkg["Name"].as_str().ok_or("Failed to get package name")?;
+    let pkg_directory = baur_directory.join(pkg_name);
+    let repo = format!("https://aur.archlinux.org/{}.git", pkg_name);
+
+    std::process::Command::new("git")
+        .arg("clone")
+        .arg(repo)
+        .arg(&pkg_directory)
+        .current_dir(baur_directory)
+        .output()?;
+
+    Ok(pkg_directory)
+}
+
+fn build_package(pkg_directory: &PathBuf) -> Result<(), Box<dyn Error>> {
+    let mut child = Command::new("makepkg")
         .arg("-si")
-        .current_dir(directory)
+        .current_dir(pkg_directory)
         .stdout(Stdio::piped())
         .spawn()?;
 
-    if let Some(stdout) = process.stdout {
-        let reader = BufReader::new(stdout);
+    let stdout = child.stdout.as_mut().ok_or("Failed to get stdout")?;
+    let reader = BufReader::new(stdout);
 
-        for line in reader.lines() {
-            match line {
-                Ok(line) => println!("{}", line),
-                Err(e) => eprintln!("Error reading line: {}", e),
-            }
+    for line in reader.lines() {
+        match line {
+            Ok(line) => println!("{}", line),
+            Err(e) => eprintln!("Error reading line: {}", e),
         }
+    }
+
+    let status = child.wait()?;
+
+    if !status.success() {
+        return Err("Failed to build package".into());
     }
 
     Ok(())
